@@ -1,0 +1,571 @@
+Add 'hash' and 'phash' function to pcap for network partitioning.
+
+Copyright (C) 2008 Open Systems AG
+Authors: Benoit Dupasquier, David Schweikert
+
+License: same as libpcap (BSD)
+
+Usage: hash|phash INST TOTAL
+
+  INST is instance number and is a number between 0 and TOTAL-1
+  TOTAL is the number of instances.
+
+  hash uses the source and destination IP addresses to compute a hash.
+  phash uses additionally port numbers, if available.
+
+diff -bur libpcap-1.2.1-orig/gencode.c libpcap-1.2.1/gencode.c
+--- libpcap-1.2.1-orig/gencode.c	2012-01-02 01:47:37.000000000 +0100
++++ libpcap-1.2.1/gencode.c	2012-05-25 11:52:38.000000000 +0200
+@@ -213,6 +213,8 @@
+ static struct block *gen_bcmp(enum e_offrel, u_int, u_int, const u_char *);
+ static struct block *gen_ncmp(enum e_offrel, bpf_u_int32, bpf_u_int32,
+     bpf_u_int32, bpf_u_int32, int, bpf_int32);
++static struct slist *gen_mod(int, int);
++static struct slist *gen_add_port_and_x(int);
+ static struct slist *gen_load_llrel(u_int, u_int);
+ static struct slist *gen_load_macplrel(u_int, u_int);
+ static struct slist *gen_load_a(enum e_offrel, u_int, u_int);
+@@ -231,6 +233,7 @@
+ static struct slist *gen_llprefixlen(void);
+ static struct slist *gen_off_macpl(void);
+ static int ethertype_to_ppptype(int);
++static struct block *gen_hash(int, int, int);
+ static struct block *gen_linktype(int);
+ static struct block *gen_snap(bpf_u_int32, bpf_u_int32);
+ static struct block *gen_llc_linktype(int);
+@@ -617,6 +620,479 @@
+ 	b->sense = !b->sense;
+ }
+ 
++/*
++ * Compute the modulo operation.
++ */
++struct slist *
++gen_mod(nb, reg)
++	int nb, reg;
++{
++	int i = 0, j;
++	struct slist *s[6];
++  
++	/* 
++	 * If nb is a power of two, we calculate
++	 * the modulo using AND (more efficient). 
++	 */
++	if ((nb & (nb-1)) == 0)
++	{
++		/*
++		 * A <- A & (nb-1)
++		 */
++		s[i] = new_stmt(BPF_ALU|BPF_AND|BPF_K);
++		s[i]->s.k = nb-1;
++	}
++	else
++	{
++		/* 
++		 * Otherwise, we do it the longer way... 
++		 * (i.e. a mod b = a - b * [a/b])
++		 */
++		/*
++		 * M[reg] <- A
++		 */
++		s[i] = new_stmt(BPF_ST);
++		s[i]->s.k = reg;
++		i++;
++		/*
++		 * A <- A / nb 
++		 */
++		s[i] = new_stmt(BPF_ALU|BPF_DIV|BPF_K);
++		s[i]->s.k = nb;
++		i++;
++		/* 
++		 * A <- A * nb 
++		 */
++		s[i] = new_stmt(BPF_ALU|BPF_MUL|BPF_K);
++		s[i]->s.k = nb;
++		i++;
++		/* 
++		 * X <- A
++		 */
++		s[i] = new_stmt(BPF_MISC|BPF_TAX);
++		i++;
++		/* 
++		 * A <- M[reg]
++		 */	
++		s[i] = new_stmt(BPF_LD|BPF_MEM);
++		s[i]->s.k = reg;
++		i++;
++		/* 
++		 * A <- A - X
++		 */
++		s[i] = new_stmt(BPF_ALU|BPF_SUB|BPF_X);
++	}
++
++	for (j = 0; j < i; j++)
++	{
++		sappend(s[0], s[j+1]);
++	}
++
++	return s[0];
++}
++
++/*
++ * Compute the addition between the source
++ * and destination port numbers and the 
++ * value stored in register reg.
++ */
++struct slist *
++gen_add_port_and_x(reg)
++	int reg;
++{
++	int i = 0, j;
++	struct slist *s[11];
++
++	/* 
++	 * Get the IP header length
++	 * X <- 4 * (P[14:1] & 0xf)
++	 */
++	s[i] = new_stmt(BPF_LDX|BPF_MSH|BPF_B);
++	s[i]->s.k = 14; /* ETHERNET_HEADER_LEN */
++	i++;
++	/* 
++	 * Load the source port (sport)
++	 * A <- P[14] (= sport)
++	 */
++	s[i] = new_stmt(BPF_LD|BPF_H|BPF_IND); 
++	s[i]->s.k = 14;
++	i++;
++	/* 
++	 * Copy the accumulator to register X
++	 * X <- A
++	 */
++	s[i] = new_stmt(BPF_MISC|BPF_TAX);
++	i++;
++	/* 
++	 * Load the value stored at reg in the memory 
++	 * (for our purpose: saddr+daddr)
++	 * A <- M[reg] (= saddr + daddr)
++	 */
++	s[i] = new_stmt(BPF_LD|BPF_MEM);
++	s[i]->s.k = reg;
++	i++;
++	/* 
++	 * A <- A + X (= saddr + daddr + sport)
++	 */
++	s[i] = new_stmt(BPF_ALU|BPF_ADD|BPF_X);
++	i++;
++	/*
++	 * M[reg] = A
++	 */
++	s[i] = new_stmt(BPF_ST);
++	s[i]->s.k = reg;
++	i++;
++	/* 
++	 * Get the IP header length
++	 * X <- 4 * (P[14:1] & 0xf)
++	 */
++	s[i] = new_stmt(BPF_LDX|BPF_MSH|BPF_B);
++	s[i]->s.k = 14; /* ETHERNET_HEADER_LEN */
++	i++;
++	/*
++	 * Load the destination port (dport)
++	 * A <- P[16] (= dport)
++	 */
++	s[i] = new_stmt(BPF_LD|BPF_H|BPF_IND);
++	s[i]->s.k = 16;
++	i++;
++	/*
++	 * Copy the accumulator to register X
++	 * X <- A
++	 */
++	s[i] = new_stmt(BPF_MISC|BPF_TAX);
++	i++;
++	/*
++	 * A <- M[reg] (= saddr + daddr + sport)
++	 */
++	s[i] = new_stmt(BPF_LD|BPF_MEM);
++	s[i]->s.k = reg;
++	i++;
++	/*
++	 * A <- A + X
++	 */
++	s[i] = new_stmt(BPF_ALU|BPF_ADD|BPF_X);
++
++	for (j = 0; j < i; j++)
++	{
++		sappend(s[0], s[j+1]);
++	}
++
++	return s[0];
++}
++
++struct block *
++gen_full_hash(id, nb)
++	int id, nb;
++{
++	return gen_hash(1, id, nb);
++}
++
++struct block *
++gen_small_hash(id, nb)
++	int id, nb;
++{
++	return gen_hash(0, id, nb);
++}
++
++/*
++ * gen_hash: algorithm
++ * -------------------
++ *  Input parameters:
++ *    nb: number of instance
++ *    id: Instance id (0 < id < nb)
++ *
++ *  1) Is it an IP packet?
++ *     1.a) Yes: check if it is fragmented (goto 2).
++ *     1.b) No: accept the packet only f id == 0.
++ *
++ *  2) Is the IP packet fragmented?
++ *     2.a) Yes: compute its simplified hash (goto 6).
++ *     2.b) No: check if it is a TCP packet (goto 3).
++ *
++ *  3) Is it a TCP packet?
++ *     3.a) Yes: compute its hash (goto 5).
++ *     3.b) No: check if it is a UDP packet (goto 4).
++ *  
++ *  4) Is it a UDP packet?
++ *     4.a) Yes: compute its hash (goto 5).
++ *     4.b) No: compute its simplified hash (goto 6).
++ *  
++ *  5) Accept the packet only if the following identity is satisfied:
++ *     (src_addr + dest_addr + src_port + dest_port) % nb == id
++ *  
++ *  6) Accept the packet only if the following identity is satisfied:
++ *     (src_addr + dest_addr) % nb == id
++ */
++struct block *
++gen_hash(full, id, nb)
++	int full, id, nb;
++{
++	int i = 0, k, 
++	    reg = alloc_reg(), 
++	    fix_jip = 0, fix_jfrag = 0,
++	    fix_jtcp = 0, fix_judp = 0, 
++	    fix_jhtcp = 0, fix_jhmisc = 0; 
++	struct block *b;
++	struct slist *s[27];
++
++	/* 
++	 * Load the ethernet type
++	 */
++	s[i] = new_stmt(BPF_LD|BPF_H|BPF_ABS);
++	s[i]->s.k = 12;
++
++	/* 
++	 * Is it an IP packet?
++	 * If it is, we continue and check if it is a TCP packet.
++	 * Otherwise, if id == 0, we process it. If id != 0, we
++	 * drop it.
++	 */
++	i++; 
++	s[i] = new_stmt(BPF_JMP|BPF_JEQ|BPF_K);
++	s[i]->s.k = ETHERTYPE_IP;
++	fix_jip = i;
++
++	if (full)
++	{
++		/*
++	 	 * Load the IP flags
++	 	 * A <- IP flags
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_LD|BPF_H|BPF_ABS);
++		s[i]->s.k = 20;
++		s[fix_jip]->s.jt = s[i];
++
++		/*
++	 	 * Check that the IP fragment offset is 0.
++	 	 * If it is non zero, compute the hash with only the
++	 	 * addresses. Otherwise, continue and check the protocol.
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_JMP|BPF_JSET|BPF_K);
++		s[i]->s.k = 0x1fff;
++		fix_jfrag = i;
++
++		/* 
++	 	 * Load the IP protocol
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_LD|BPF_B|BPF_ABS);
++		s[i]->s.k = 23;
++		s[fix_jfrag]->s.jf = s[i];
++
++		/* 
++	 	 * If we have a TCP packet, we compute the
++	 	 * full hash of the packet (i.e. goto H_TCP). 
++	 	 * Otherwise, we check if it is a UDP packet.
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_JMP|BPF_JEQ|BPF_K);
++		s[i]->s.k = IPPROTO_TCP;
++		fix_jtcp = i;
++
++		/* 
++	 	 * If we have a UDP packet, we compute the
++	 	 * full hash of the packet (i.e. goto H_TCP).
++	 	 * Otherwise, we compute the small hash 
++	 	 * (i.e. goto H_MISC)
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_JMP|BPF_JEQ|BPF_K);
++		s[i]->s.k = IPPROTO_UDP;
++		s[fix_jtcp]->s.jf = s[i];
++		fix_judp = i;
++
++		/* 
++	 	 * H_TCP: 
++		 * return ((saddr + daddr + sport + dport) % nb) == id
++	 	 */
++		/*
++		 * Load the source IP address (saddr)
++	 	 * A <- saddr
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_LD|BPF_W|BPF_ABS);
++		s[i]->s.k = 26;
++		s[fix_jtcp]->s.jt = s[i];
++		s[fix_judp]->s.jt = s[i];
++		/*
++	 	 * Store it in a register
++	 	 * M[reg] <- A
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_ST);
++		s[i]->s.k = reg;
++		/*
++	 	 * Load the destination IP address (daddr)
++	 	 * A <- daddr
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_LD|BPF_W|BPF_ABS);
++		s[i]->s.k = 30;
++		/*
++	 	 * Copy the accumulator to register X
++	 	 * X <- A (= daddr)
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_MISC|BPF_TAX);
++		/* 
++	 	 * Load the previously stored saddr
++	 	 * A <- M[reg] (= saddr)
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_LD|BPF_MEM);
++		s[i]->s.k = reg;
++		/*
++	 	 * Add both addresses together
++	 	 * A <- A + X
++	 	 */
++		i++; 
++		s[i] = new_stmt(BPF_ALU|BPF_ADD|BPF_X);
++		/*
++	 	 * M[reg] <- A
++	 	 */
++		i++;
++		s[i] = new_stmt(BPF_ST);
++		s[i]->s.k = reg;
++		i++;
++		s[i] = gen_add_port_and_x(reg);
++		i++;
++		s[i] = gen_mod(nb, reg);
++		i++;
++		s[i] = new_stmt(BPF_JMP|BPF_JEQ|BPF_K);
++		s[i]->s.k = id;
++		fix_jhtcp = i;
++	}
++
++	/* 
++	 * H_MISC: 
++	 * return ((saddr + daddr) % nb) == id)
++	 */
++	/* 
++	 * Load the source IP address (saddr)
++	 * A <- saddr
++	 */
++	i++;
++	s[i] = new_stmt(BPF_LD|BPF_W|BPF_ABS); // saddr
++	s[i]->s.k = 26;
++	if (full)
++	{
++		s[fix_judp]->s.jf = s[i];
++		s[fix_jfrag]->s.jt = s[i];
++	}
++	else
++	{
++		s[fix_jip]->s.jt = s[i];
++	}
++	/*
++	 * Store it a register
++	 * M[reg] <- A
++	 */
++	i++;
++	s[i] = new_stmt(BPF_ST);
++	s[i]->s.k = reg;
++	/*
++	 * Load the destination IP address (daddr)
++	 * A <- daddr
++	 */
++	i++;
++	s[i] = new_stmt(BPF_LD|BPF_W|BPF_ABS); // daddr
++	s[i]->s.k = 30;
++	/*
++	 * Copy the accumulator to register X
++	 * X <- A (= daddr)
++	 */
++	i++;
++	s[i] = new_stmt(BPF_MISC|BPF_TAX);
++	/*
++	 * Load the previously stored saddr
++	 * A <- M[reg] (= saddr)
++	 */
++	i++;
++	s[i] = new_stmt(BPF_LD|BPF_MEM);
++	s[i]->s.k = reg;
++	/*
++	 * Add both addresses together
++	 * A <- A + X
++	 */
++	i++;
++	s[i] = new_stmt(BPF_ALU|BPF_ADD|BPF_X);
++	i++;
++	s[i] = gen_mod(nb, reg);
++	i++;
++	s[i] = new_stmt(BPF_JMP|BPF_JEQ|BPF_K);
++	s[i]->s.k = id;
++	fix_jhmisc = i;
++
++	/*
++	 * Build the return block
++	 */
++	b = new_block(JMP(BPF_JEQ));
++	b->stmts = s[0];
++
++	/* 
++	 * PROCESS: 
++	 * Accept the packet
++	 */
++	i++;
++	s[i] = new_stmt(BPF_RET|BPF_K);
++	s[i]->s.k = (u_int) -1;
++	/* 
++	 * Accept non IP packets if id == 0
++	 */
++	if (id == 0) 
++	{
++		s[fix_jip]->s.jf = s[i];
++	}
++	/* 
++	 * Process all packets for whose 
++	 * the hash is equal to the id 
++	 */
++	s[fix_jhmisc]->s.jt = s[i];
++	if (full)
++	{
++		s[fix_jhtcp]->s.jt = s[i];
++	}
++	b->s.jt = s[i];
++  
++	/* 
++	 * DROP: 
++	 * Reject the packet
++	 */
++	i++;
++	s[i] = new_stmt(BPF_RET|BPF_K);
++	s[i]->s.k = 0;
++	/* 
++	 * Drop non IP packets if id != 0
++	 */
++	if (id != 0) 
++	{
++		s[fix_jip]->s.jf = s[i];
++	}
++	/* 
++	 * Drop all packets for whose the 
++	 * hash is not equal to the id 
++	 */
++	if (full)
++	{
++		s[fix_jhtcp]->s.jf = s[i];
++	}
++	s[fix_jhmisc]->s.jf = s[i];
++	b->s.jf = s[i];
++
++	/* 
++	 * Concatenate the statements
++	 */
++	for (k = 0; k < i; k++)
++	{
++		sappend(s[0], s[k+1]);
++	}
++
++	return b;
++}
++
+ static struct block *
+ gen_cmp(offrel, offset, size, v)
+ 	enum e_offrel offrel;
+diff -bur libpcap-1.2.1-orig/gencode.h libpcap-1.2.1/gencode.h
+--- libpcap-1.2.1-orig/gencode.h	2012-01-02 01:47:37.000000000 +0100
++++ libpcap-1.2.1/gencode.h	2012-05-25 11:51:44.000000000 +0200
+@@ -68,6 +68,8 @@
+ #define Q_PROTO		5
+ #define Q_PROTOCHAIN	6
+ #define Q_PORTRANGE	7
++#define Q_HASH 		8
++#define Q_PHASH		9
+ 
+ /* Protocol qualifiers. */
+ 
+@@ -278,6 +280,9 @@
+ struct arth *gen_neg(struct arth *);
+ struct arth *gen_arth(int, struct arth *, struct arth *);
+ 
++struct block *gen_full_hash(int, int);
++struct block *gen_small_hash(int, int);
++
+ void gen_and(struct block *, struct block *);
+ void gen_or(struct block *, struct block *);
+ void gen_not(struct block *);
+diff -bur libpcap-1.2.1-orig/grammar.y libpcap-1.2.1/grammar.y
+--- libpcap-1.2.1-orig/grammar.y	2012-01-02 01:47:37.000000000 +0100
++++ libpcap-1.2.1/grammar.y	2012-05-25 11:51:44.000000000 +0200
+@@ -270,7 +270,7 @@
+ %type	<blk>	mtp3fieldvalue mtp3value mtp3listvalue
+ 
+ 
+-%token  DST SRC HOST GATEWAY
++%token  DST SRC HOST GATEWAY HASH PHASH
+ %token  NET NETMASK PORT PORTRANGE LESS GREATER PROTO PROTOCHAIN CBYTE
+ %token  ARP RARP IP SCTP TCP UDP ICMP IGMP IGRP PIM VRRP CARP
+ %token  ATALK AARP DECNET LAT SCA MOPRC MOPDL
+@@ -426,6 +426,8 @@
+ 	| atmfield atmvalue	{ $$.b = $2.b; $$.q = qerr; }
+ 	| mtp2type		{ $$.b = gen_mtp2type_abbrev($1); $$.q = qerr; }
+ 	| mtp3field mtp3value	{ $$.b = $2.b; $$.q = qerr; }
++	| HASH pnum pnum 	{ $$.b = gen_small_hash($2, $3); }
++	| PHASH pnum pnum 	{ $$.b = gen_full_hash($2, $3); }
+ 	;
+ /* protocol level qualifiers */
+ pqual:	  pname
+diff -bur libpcap-1.2.1-orig/scanner.l libpcap-1.2.1/scanner.l
+--- libpcap-1.2.1-orig/scanner.l	2012-01-02 01:47:37.000000000 +0100
++++ libpcap-1.2.1/scanner.l	2012-05-25 11:51:44.000000000 +0200
+@@ -278,6 +278,9 @@
+ ra		return RA;
+ ta		return TA;
+ 
++hash  		return HASH;
++phash 		return PHASH;
++
+ less		return LESS;
+ greater		return GREATER;
+ byte		return CBYTE;
